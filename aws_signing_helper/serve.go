@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"io"
 	"log"
 	"net"
@@ -288,6 +290,18 @@ func Serve(port int, credentialsOptions CredentialsOpts) {
 	roleResourceParts := strings.Split(roleArn.Resource, "/")
 	roleName := roleResourceParts[len(roleResourceParts)-1] // Find role name without path
 	putTokenHandler, getRoleNameHandler, getCredentialsHandler := AllIssuesHandlers(&endpoint.TmpCred, roleName, &credentialsOptions, signer, signatureAlgorithm)
+
+	http.HandleFunc("/health", func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	})
+
+	http.Handle(`/metrics`, promhttp.HandlerFor(
+		prometheus.DefaultGatherer,
+		promhttp.HandlerOpts{
+			Registry:           prometheus.DefaultRegisterer,
+			DisableCompression: false,
+			EnableOpenMetrics:  false,
+		}))
 
 	http.HandleFunc(TOKEN_RESOURCE_PATH, putTokenHandler)
 	http.HandleFunc(SECURITY_CREDENTIALS_RESOURCE_PATH, getRoleNameHandler)
