@@ -8,6 +8,7 @@ require (
 	github.com/spf13/cobra v1.6.1
 	golang.org/x/crypto v0.10.0
 	golang.org/x/sys v0.11.0
+	github.com/sirupsen/logrus v1.9.3 // indirect
 )
 
 require (

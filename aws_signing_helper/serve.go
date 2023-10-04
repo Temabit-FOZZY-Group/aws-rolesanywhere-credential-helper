@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	log "github.com/sirupsen/logrus"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -37,6 +37,7 @@ type RefreshableCred struct {
 }
 
 type Endpoint struct {
+	Host    string
 	PortNum int
 	Server  *http.Server
 	TmpCred RefreshableCred
@@ -62,8 +63,9 @@ const MAX_TOKENS = 256
 
 var mutex sync.Mutex
 var tokenMap = make(map[string]time.Time)
+var credMutex sync.Mutex
 
-// Generates a random string with the specified length
+// GenerateToken - Generates a random string with the specified length
 func GenerateToken(length int) (string, error) {
 	if length < 0 || length >= 128 {
 		msg := "invalid token length"
@@ -77,7 +79,7 @@ func GenerateToken(length int) (string, error) {
 	return base64.StdEncoding.EncodeToString(randomBytes)[:length], nil
 }
 
-// Removes the token that expires the earliest
+// InsertToken - Removes the token that expires the earliest
 func InsertToken(token string, expirationTime time.Time) error {
 	mutex.Lock()
 	if len(tokenMap) == MAX_TOKENS {
@@ -98,13 +100,18 @@ func InsertToken(token string, expirationTime time.Time) error {
 	return nil
 }
 
-// Helper function that checks to see whether the token provided in the request is valid
+// CheckValidToken - Helper function that checks to see whether the token provided in the request is valid
 func CheckValidToken(w http.ResponseWriter, r *http.Request) error {
 	token := r.Header.Get(EC2_METADATA_TOKEN_HEADER)
 	if token == "" {
 		w.WriteHeader(http.StatusUnauthorized)
 		msg := "no token provided"
-		io.WriteString(w, msg)
+
+		log.WithFields(log.Fields{
+			"status": http.StatusUnauthorized,
+		}).Warn(msg)
+
+		_, _ = io.WriteString(w, msg)
 		return errors.New(msg)
 	}
 
@@ -115,20 +122,30 @@ func CheckValidToken(w http.ResponseWriter, r *http.Request) error {
 		if time.Now().After(expiration) {
 			w.WriteHeader(http.StatusUnauthorized)
 			msg := "invalid token provided"
-			io.WriteString(w, msg)
+
+			log.WithFields(log.Fields{
+				"status": http.StatusUnauthorized,
+			}).Warn(msg)
+
+			_, _ = io.WriteString(w, msg)
 			return errors.New(msg)
 		}
 	} else {
 		w.WriteHeader(http.StatusUnauthorized)
 		msg := "invalid token provided"
-		io.WriteString(w, msg)
+
+		log.WithFields(log.Fields{
+			"status": http.StatusUnauthorized,
+		}).Warn(msg)
+
+		_, _ = io.WriteString(w, msg)
 		return errors.New(msg)
 	}
 
 	return nil
 }
 
-// Helper function that finds a token's TTL in seconds
+// FindTokenTTLSeconds - Helper function that finds a token's TTL in seconds
 func FindTokenTTLSeconds(r *http.Request) (string, error) {
 	token := r.Header.Get(EC2_METADATA_TOKEN_HEADER)
 	if token == "" {
@@ -152,7 +169,18 @@ func FindTokenTTLSeconds(r *http.Request) (string, error) {
 func AllIssuesHandlers(cred *RefreshableCred, roleName string, opts *CredentialsOpts, signer Signer, signatureAlgorithm string) (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc) {
 	// Handles PUT requests to /latest/api/token/
 	putTokenHandler := func(w http.ResponseWriter, r *http.Request) {
+
+		_log := log.WithFields(log.Fields{
+			"method":   r.Method,
+			"endpoint": "put_token",
+		})
+
 		if r.Method != "PUT" {
+
+			_log.WithFields(log.Fields{
+				"status": http.StatusMethodNotAllowed,
+			}).Warn("method is not supported")
+
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
@@ -160,8 +188,13 @@ func AllIssuesHandlers(cred *RefreshableCred, roleName string, opts *Credentials
 		// Check for the presence of the X-Forwarded-For header
 		xForwardedForHeader := r.Header.Get(X_FORWARDED_FOR_HEADER) // canonicalized headers are used (casing doesn't matter)
 		if xForwardedForHeader != "" {
+
+			_log.WithFields(log.Fields{
+				"status": http.StatusBadRequest,
+			}).Warn("unable to process requests with X-Forwarded-For header")
+
 			w.WriteHeader(http.StatusBadRequest)
-			io.WriteString(w, "unable to process requests with X-Forwarded-For header")
+			_, _ = io.WriteString(w, "unable to process requests with X-Forwarded-For header")
 			return
 		}
 
@@ -172,28 +205,53 @@ func AllIssuesHandlers(cred *RefreshableCred, roleName string, opts *Credentials
 		}
 		tokenTTL, err := strconv.Atoi(tokenTTLStr)
 		if err != nil || tokenTTL < 1 || tokenTTL > 21600 {
+
+			_log.WithFields(log.Fields{
+				"status": http.StatusBadRequest,
+			}).Warn("invalid token ttl")
+
 			w.WriteHeader(http.StatusBadRequest)
-			io.WriteString(w, "invalid token TTL")
+			_, _ = io.WriteString(w, "invalid token TTL")
 			return
 		}
 
 		// Generate token and insert it into map
 		token, err := GenerateToken(100)
 		if err != nil {
+
+			_log.WithFields(log.Fields{
+				"status": http.StatusInternalServerError,
+			}).Warn("unable to generate token")
+
 			w.WriteHeader(http.StatusInternalServerError)
-			io.WriteString(w, "unable to generate token")
+			_, _ = io.WriteString(w, "unable to generate token")
 			return
 		}
 		expirationTime := time.Now().Add(time.Second * time.Duration(tokenTTL))
-		InsertToken(token, expirationTime)
+		_ = InsertToken(token, expirationTime)
 
 		w.Header().Set(EC2_METADATA_TOKEN_TTL_HEADER, tokenTTLStr)
-		io.WriteString(w, token) // nosemgrep
+		_, _ = io.WriteString(w, token) // nosemgrep
+
+		_log.WithFields(log.Fields{
+			"status": http.StatusOK,
+		}).Info("token has been generated successfully")
 	}
 
 	// Handles requests to /latest/meta-data/iam/security-credentials/
 	getRoleNameHandler := func(w http.ResponseWriter, r *http.Request) {
+
+		_log := log.WithFields(log.Fields{
+			"method":   r.Method,
+			"endpoint": "get_role_name_handler",
+		})
+
 		if r.Method != "GET" {
+
+			_log.WithFields(log.Fields{
+				"status": http.StatusMethodNotAllowed,
+			}).Warn("method is not supported")
+
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
@@ -205,16 +263,32 @@ func AllIssuesHandlers(cred *RefreshableCred, roleName string, opts *Credentials
 
 		tokenTTL, err := FindTokenTTLSeconds(r)
 		if err != nil {
+
+			_log.WithError(err).WithFields(log.Fields{
+				"status": http.StatusUnauthorized,
+			}).Warn("token is not found or expired")
+
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		w.Header().Set(EC2_METADATA_TOKEN_TTL_HEADER, tokenTTL)
-		io.WriteString(w, roleName) // nosemgrep
+		_, _ = io.WriteString(w, roleName) // nosemgrep
 	}
 
 	// Handles GET requests to /latest/meta-data/iam/security-credentials/<ROLE_NAME>
 	getCredentialsHandler := func(w http.ResponseWriter, r *http.Request) {
+
+		_log := log.WithFields(log.Fields{
+			"method":   r.Method,
+			"endpoint": "get_credentials_handler",
+		})
+
 		if r.Method != "GET" {
+
+			_log.WithFields(log.Fields{
+				"status": http.StatusMethodNotAllowed,
+			}).Warn("method is not supported")
+
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
@@ -224,34 +298,49 @@ func AllIssuesHandlers(cred *RefreshableCred, roleName string, opts *Credentials
 			return
 		}
 
+		credMutex.Lock()
 		var nextRefreshTime = cred.Expiration.Add(-RefreshTime)
 		if time.Until(nextRefreshTime) < RefreshTime {
 			credentialProcessOutput, _ := GenerateCredentials(opts, signer, signatureAlgorithm)
 			cred.AccessKeyId = credentialProcessOutput.AccessKeyId
 			cred.SecretAccessKey = credentialProcessOutput.SecretAccessKey
 			cred.Token = credentialProcessOutput.SessionToken
-			cred.Expiration, _ = time.Parse(time.RFC3339, credentialProcessOutput.Expiration)
+			cred.Expiration, err = time.Parse(time.RFC3339, credentialProcessOutput.Expiration)
+			if err != nil {
+				credMutex.Unlock()
+				_log.WithError(err).WithFields(log.Fields{
+					"format": "RFC3339",
+					"value":  credentialProcessOutput.Expiration,
+					"status": http.StatusInternalServerError,
+				}).Error("cannot parse expiration date")
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			cred.Code = REFRESHABLE_CRED_CODE
 			cred.LastUpdated = time.Now()
 			cred.Type = REFRESHABLE_CRED_TYPE
-			err := json.NewEncoder(w).Encode(cred)
+		}
+		credMutex.Unlock()
 
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				io.WriteString(w, "failed to encode credentials")
-				return
-			}
-		} else {
-			err := json.NewEncoder(w).Encode(cred)
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				io.WriteString(w, "failed to encode credentials")
-				return
-			}
+		err = json.NewEncoder(w).Encode(cred)
+		if err != nil {
+
+			_log.WithError(err).WithFields(log.Fields{
+				"status": http.StatusInternalServerError,
+			}).Warn("failed to encode credentials")
+
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, "failed to encode credentials")
+			return
 		}
 
 		tokenTTL, err := FindTokenTTLSeconds(r)
 		if err != nil {
+
+			_log.WithError(err).WithFields(log.Fields{
+				"status": http.StatusUnauthorized,
+			}).Warn("token is not found or expired")
+
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -261,7 +350,7 @@ func AllIssuesHandlers(cred *RefreshableCred, roleName string, opts *Credentials
 	return putTokenHandler, getRoleNameHandler, getCredentialsHandler
 }
 
-func Serve(port int, credentialsOptions CredentialsOpts) {
+func Serve(host string, port int, credentialsOptions CredentialsOpts) {
 	var refreshableCred = RefreshableCred{}
 
 	roleArn, err := arn.Parse(credentialsOptions.RoleArn)
@@ -298,6 +387,7 @@ func Serve(port int, credentialsOptions CredentialsOpts) {
 	http.Handle(`/metrics`, promhttp.HandlerFor(
 		prometheus.DefaultGatherer,
 		promhttp.HandlerOpts{
+			ErrorLog:           log.StandardLogger(),
 			Registry:           prometheus.DefaultRegisterer,
 			DisableCompression: false,
 			EnableOpenMetrics:  false,
@@ -324,17 +414,19 @@ func Serve(port int, credentialsOptions CredentialsOpts) {
 	}()
 
 	// Start the credentials endpoint
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", LocalHostAddress, endpoint.PortNum))
+	addr := fmt.Sprintf("%s:%d", host, port)
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Println("failed to create listener")
-		os.Exit(1)
+		log.Fatal("failed to create listener")
 	}
-	endpoint.PortNum = listener.Addr().(*net.TCPAddr).Port
-	log.Println("Local server started on port:", endpoint.PortNum)
+
+	log.Println("Local server started on port:", port)
 	log.Println("Make it available to the sdk by running:")
-	log.Printf("export AWS_EC2_METADATA_SERVICE_ENDPOINT=http://%s:%d/", LocalHostAddress, endpoint.PortNum)
+	log.Printf("export AWS_EC2_METADATA_SERVICE_ENDPOINT=http://%s/", addr)
+
 	if err := endpoint.Server.Serve(listener); err != nil {
-		log.Println("Httpserver: ListenAndServe() error")
-		os.Exit(1)
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal("Httpserver: ListenAndServe() error")
+		}
 	}
 }
