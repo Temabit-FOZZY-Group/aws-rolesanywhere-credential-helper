@@ -1,6 +1,7 @@
 package aws_signing_helper
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -52,7 +53,8 @@ const SECURITY_CREDENTIALS_RESOURCE_PATH = "/latest/meta-data/iam/security-crede
 
 const EC2_METADATA_TOKEN_HEADER = "x-aws-ec2-metadata-token"
 const EC2_METADATA_TOKEN_TTL_HEADER = "x-aws-ec2-metadata-token-ttl-seconds"
-const DEFAULT_TOKEN_TTL_SECONDS = "21600"
+const MAX_TOKEN_TTL_SECONDS = 21600
+const DEFAULT_TOKEN_TTL_SECONDS = MAX_TOKEN_TTL_SECONDS
 
 const X_FORWARDED_FOR_HEADER = "X-Forwarded-For"
 
@@ -61,7 +63,7 @@ const REFRESHABLE_CRED_CODE = "Success"
 
 const MAX_TOKENS = 256
 
-var mutex sync.Mutex
+var tokenStorageMutex sync.Mutex
 var tokenMap = make(map[string]time.Time)
 var credMutex sync.Mutex
 
@@ -81,7 +83,7 @@ func GenerateToken(length int) (string, error) {
 
 // InsertToken - Removes the token that expires the earliest
 func InsertToken(token string, expirationTime time.Time) error {
-	mutex.Lock()
+	tokenStorageMutex.Lock()
 	if len(tokenMap) == MAX_TOKENS {
 		earliestExpirationTime := time.Unix(1<<63-1, 0)
 		var earliestExpiringToken string
@@ -96,7 +98,7 @@ func InsertToken(token string, expirationTime time.Time) error {
 		log.Printf("evicting earliest expiring token: %s", earliestExpiringToken)
 	}
 	tokenMap[token] = expirationTime
-	mutex.Unlock()
+	tokenStorageMutex.Unlock()
 	return nil
 }
 
@@ -115,9 +117,9 @@ func CheckValidToken(w http.ResponseWriter, r *http.Request) error {
 		return errors.New(msg)
 	}
 
-	mutex.Lock()
+	tokenStorageMutex.Lock()
 	expiration, ok := tokenMap[token]
-	mutex.Unlock()
+	tokenStorageMutex.Unlock()
 	if ok {
 		if time.Now().After(expiration) {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -153,9 +155,9 @@ func FindTokenTTLSeconds(r *http.Request) (string, error) {
 		return "", errors.New(msg)
 	}
 
-	mutex.Lock()
+	tokenStorageMutex.Lock()
 	expiration, ok := tokenMap[token]
-	mutex.Unlock()
+	tokenStorageMutex.Unlock()
 	if ok {
 		tokenTTLFloat := expiration.Sub(time.Now()).Seconds()
 		tokenTTLInt64 := int64(tokenTTLFloat)
@@ -201,10 +203,10 @@ func AllIssuesHandlers(cred *RefreshableCred, roleName string, opts *Credentials
 		// Obtain the token TTL
 		tokenTTLStr := r.Header.Get(EC2_METADATA_TOKEN_TTL_HEADER)
 		if tokenTTLStr == "" {
-			tokenTTLStr = DEFAULT_TOKEN_TTL_SECONDS
+			tokenTTLStr = strconv.Itoa(DEFAULT_TOKEN_TTL_SECONDS)
 		}
 		tokenTTL, err := strconv.Atoi(tokenTTLStr)
-		if err != nil || tokenTTL < 1 || tokenTTL > 21600 {
+		if err != nil || tokenTTL < 1 || tokenTTL > MAX_TOKEN_TTL_SECONDS {
 
 			_log.WithFields(log.Fields{
 				"status": http.StatusBadRequest,
@@ -350,7 +352,7 @@ func AllIssuesHandlers(cred *RefreshableCred, roleName string, opts *Credentials
 	return putTokenHandler, getRoleNameHandler, getCredentialsHandler
 }
 
-func Serve(host string, port int, credentialsOptions CredentialsOpts) {
+func Serve(ctx context.Context, host string, port int, credentialsOptions CredentialsOpts) {
 	var refreshableCred = RefreshableCred{}
 
 	roleArn, err := arn.Parse(credentialsOptions.RoleArn)
@@ -399,17 +401,26 @@ func Serve(host string, port int, credentialsOptions CredentialsOpts) {
 
 	// Background thread that cleans up expired tokens
 	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 	go func() {
-		for range ticker.C {
+		flush := func() {
+			tokenStorageMutex.Lock()
+			defer tokenStorageMutex.Unlock()
 			curTime := time.Now()
-			mutex.Lock()
 			for key, value := range tokenMap {
 				if curTime.After(value) {
 					delete(tokenMap, key)
 					log.Printf("removed expired token: %s", key)
 				}
 			}
-			mutex.Unlock()
+		}
+		for {
+			select {
+			case <-ticker.C:
+				flush()
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 
@@ -424,7 +435,17 @@ func Serve(host string, port int, credentialsOptions CredentialsOpts) {
 	log.Println("Make it available to the sdk by running:")
 	log.Printf("export AWS_EC2_METADATA_SERVICE_ENDPOINT=http://%s/", addr)
 
-	if err := endpoint.Server.Serve(listener); err != nil {
+	go func() {
+		if err := endpoint.Server.Serve(listener); err != nil {
+			if !errors.Is(err, http.ErrServerClosed) {
+				log.Fatal("Httpserver: ListenAndServe() error")
+			}
+		}
+	}()
+
+	<-ctx.Done()
+
+	if err := endpoint.Server.Close(); err != nil {
 		if !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal("Httpserver: ListenAndServe() error")
 		}

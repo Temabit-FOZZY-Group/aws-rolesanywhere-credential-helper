@@ -7,9 +7,11 @@ import (
 )
 
 var (
-	host     string
-	port     int
-	loglevel = "info"
+	host string
+	port int
+
+	loglevel  = "info"
+	logFormat = "json"
 )
 
 func init() {
@@ -17,6 +19,7 @@ func init() {
 	serveCmd.PersistentFlags().StringVar(&host, "host", helper.LocalHostAddress, "The host used to run the server (default: 127.0.0.1)")
 	serveCmd.PersistentFlags().IntVar(&port, "port", helper.DefaultPort, "The port used to run the server (default: 9911)")
 	serveCmd.PersistentFlags().StringVar(&loglevel, "log-level", "info", "logging level")
+	serveCmd.PersistentFlags().StringVar(&logFormat, "log-format", "json", "logging format, json or logfmt")
 }
 
 var serveCmd = &cobra.Command{
@@ -29,9 +32,15 @@ var serveCmd = &cobra.Command{
 			log.WithError(err).Fatal("populate credentials options error")
 		}
 
-		log.SetFormatter(&log.JSONFormatter{
-			PrettyPrint: false,
-		})
+		if logFormat == "json" {
+			log.SetFormatter(&log.JSONFormatter{
+				PrettyPrint: false,
+			})
+		} else {
+			log.SetFormatter(&log.TextFormatter{
+				DisableColors: true,
+			})
+		}
 
 		level, err := log.ParseLevel(loglevel)
 		if err != nil {
@@ -44,6 +53,6 @@ var serveCmd = &cobra.Command{
 
 		helper.Debug = credentialsOptions.Debug
 
-		helper.Serve(host, port, credentialsOptions)
+		helper.Serve(cmd.Context(), host, port, credentialsOptions)
 	},
 }
