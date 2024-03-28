@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 	"io"
@@ -168,7 +169,7 @@ func FindTokenTTLSeconds(r *http.Request) (string, error) {
 	}
 }
 
-func AllIssuesHandlers(cred *RefreshableCred, roleName string, opts *CredentialsOpts, signer Signer, signatureAlgorithm string) (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc) {
+func AllIssuesHandlers(cred *RefreshableCred, roleName string, opts *CredentialsOpts, signer Signer, signatureAlgorithm string) (http.Handler, http.Handler, http.Handler) {
 	// Handles PUT requests to /latest/api/token/
 	putTokenHandler := func(w http.ResponseWriter, r *http.Request) {
 
@@ -349,7 +350,7 @@ func AllIssuesHandlers(cred *RefreshableCred, roleName string, opts *Credentials
 		w.Header().Set(EC2_METADATA_TOKEN_TTL_HEADER, tokenTTL)
 	}
 
-	return putTokenHandler, getRoleNameHandler, getCredentialsHandler
+	return http.HandlerFunc(putTokenHandler), http.HandlerFunc(getRoleNameHandler), http.HandlerFunc(getCredentialsHandler)
 }
 
 func Serve(ctx context.Context, host string, port int, credentialsOptions CredentialsOpts) {
@@ -386,29 +387,62 @@ func Serve(ctx context.Context, host string, port int, credentialsOptions Creden
 		writer.WriteHeader(http.StatusOK)
 	})
 
-	http.Handle(`/metrics`, promhttp.HandlerFor(
-		prometheus.DefaultGatherer,
-		promhttp.HandlerOpts{
-			ErrorLog:           log.StandardLogger(),
-			Registry:           prometheus.DefaultRegisterer,
-			DisableCompression: false,
-			EnableOpenMetrics:  false,
-		}))
+	metricsEnabled := ctx.Value("metrics") == true
 
-	http.HandleFunc(TOKEN_RESOURCE_PATH, putTokenHandler)
-	http.HandleFunc(SECURITY_CREDENTIALS_RESOURCE_PATH, getRoleNameHandler)
-	http.HandleFunc(SECURITY_CREDENTIALS_RESOURCE_PATH+roleName, getCredentialsHandler)
+	if metricsEnabled {
+
+		http.Handle(`/metrics`, promhttp.HandlerFor(
+			prometheus.DefaultGatherer,
+			promhttp.HandlerOpts{
+				ErrorLog:           log.StandardLogger(),
+				Registry:           prometheus.DefaultRegisterer,
+				DisableCompression: false,
+				EnableOpenMetrics:  false,
+			}))
+
+		createCounter := func(path string) *prometheus.CounterVec {
+			return promauto.NewCounterVec(
+				prometheus.CounterOpts{
+					Name: "api_requests_total",
+					Help: "A counter for requests to the wrapped handler.",
+					ConstLabels: prometheus.Labels{
+						"path": path,
+					},
+				},
+				[]string{"code", "method"},
+			)
+		}
+
+		putTokenHandler = promhttp.InstrumentHandlerCounter(createCounter(TOKEN_RESOURCE_PATH), putTokenHandler)
+		getRoleNameHandler = promhttp.InstrumentHandlerCounter(createCounter(SECURITY_CREDENTIALS_RESOURCE_PATH), getRoleNameHandler)
+		getCredentialsHandler = promhttp.InstrumentHandlerCounter(createCounter(SECURITY_CREDENTIALS_RESOURCE_PATH+roleName), getCredentialsHandler)
+	}
+
+	http.Handle(TOKEN_RESOURCE_PATH, putTokenHandler)
+	http.Handle(SECURITY_CREDENTIALS_RESOURCE_PATH, getRoleNameHandler)
+	http.Handle(SECURITY_CREDENTIALS_RESOURCE_PATH+roleName, getCredentialsHandler)
 
 	// Background thread that cleans up expired tokens
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
 	go func() {
-		flush := func() {
+
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		expiredTokensCounter := func() {}
+		if metricsEnabled {
+			expiredTokensCount := promauto.NewCounter(prometheus.CounterOpts{
+				Name: "token_expired_total",
+				Help: "A counter for expired tokens.",
+			})
+			expiredTokensCounter = expiredTokensCount.Inc
+		}
+
+		flush := func(curTime time.Time) {
 			tokenStorageMutex.Lock()
 			defer tokenStorageMutex.Unlock()
-			curTime := time.Now()
 			for key, value := range tokenMap {
 				if curTime.After(value) {
+					expiredTokensCounter()
 					delete(tokenMap, key)
 					log.Printf("removed expired token: %s", key)
 				}
@@ -416,8 +450,11 @@ func Serve(ctx context.Context, host string, port int, credentialsOptions Creden
 		}
 		for {
 			select {
-			case <-ticker.C:
-				flush()
+			case curTime, ok := <-ticker.C:
+				if !ok {
+					return
+				}
+				flush(curTime)
 			case <-ctx.Done():
 				return
 			}

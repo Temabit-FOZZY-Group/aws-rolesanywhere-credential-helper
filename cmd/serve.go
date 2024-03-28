@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	helper "github.com/aws/rolesanywhere-credential-helper/aws_signing_helper"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -12,14 +13,17 @@ var (
 
 	loglevel  = "info"
 	logFormat = "json"
+
+	metrics = true
 )
 
 func init() {
 	initCredentialsSubCommand(serveCmd)
 	serveCmd.PersistentFlags().StringVar(&host, "host", helper.LocalHostAddress, "The host used to run the server (default: 127.0.0.1)")
 	serveCmd.PersistentFlags().IntVar(&port, "port", helper.DefaultPort, "The port used to run the server (default: 9911)")
-	serveCmd.PersistentFlags().StringVar(&loglevel, "log-level", "info", "logging level")
-	serveCmd.PersistentFlags().StringVar(&logFormat, "log-format", "json", "logging format, json or logfmt")
+	serveCmd.PersistentFlags().StringVar(&loglevel, "log-level", loglevel, "logging level")
+	serveCmd.PersistentFlags().StringVar(&logFormat, "log-format", logFormat, "logging format, json or logfmt")
+	serveCmd.PersistentFlags().BoolVar(&metrics, "metrics", metrics, "enable prometheus metrics")
 }
 
 var serveCmd = &cobra.Command{
@@ -53,6 +57,11 @@ var serveCmd = &cobra.Command{
 
 		helper.Debug = credentialsOptions.Debug
 
-		helper.Serve(cmd.Context(), host, port, credentialsOptions)
+		ctx := cmd.Context()
+		if metrics {
+			ctx = context.WithValue(ctx, "metrics", true)
+		}
+
+		helper.Serve(ctx, host, port, credentialsOptions)
 	},
 }
